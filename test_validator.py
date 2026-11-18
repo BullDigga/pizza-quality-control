@@ -5,11 +5,12 @@
 from __future__ import annotations
 
 import math
+from itertools import combinations
 from types import SimpleNamespace
 
 from recipes import PIZZA_CLASS
 from validator import (COMPLETENESS_THRESHOLD, ClassReport, Suggestion,
-                       place_missing, validate)
+                       pick_removals, place_missing, validate)
 
 
 def det(cls_name: str, x: float, y: float, size: float = 20.0) -> SimpleNamespace:
@@ -78,23 +79,74 @@ def test_place_missing_far_from_same_class() -> None:
 
 
 def test_place_missing_spread() -> None:
-    # Нет ингредиентов вовсе -> k точек равномерно по кругу, на равных радиусах
+    # Нет ни одной детекции -> равномерная раскладка по зоне пиццы
     points = place_missing([], "Mushroom", 3, (320, 320, 300), (640, 640))
     assert len(points) == 3
-    radii = [math.hypot(x - 320, y - 320) for x, y in points]
-    assert all(abs(r - 150) < 1e-6 for r in radii)
+    assert all(math.hypot(x - 320, y - 320) <= 0.7 * 300 + 1e-6
+               for x, y in points)
     # Без зоны пиццы тоже работает (весь кадр)
     points = place_missing([], "Mushroom", 2, None, (640, 640))
     assert len(points) == 2
     print("ok: равномерное размещение при пустой пицце")
 
 
-def test_place_missing_no_same_class_uses_all() -> None:
-    # Нет грибов, но есть другие ингредиенты в левом верхнем углу
-    dets = [det("Pepperoni", 80, 80), det("Olives", 120, 90)]
-    (x, y), *_ = place_missing(dets, "Mushroom", 1, (320, 320, 300), (640, 640))
-    assert math.hypot(x - 80, y - 80) > 350, "точка должна быть далеко от всех ингредиентов"
-    print("ok: без своего класса — отталкивается от всех ингредиентов")
+def test_place_missing_no_same_class_spreads_evenly() -> None:
+    # Сыра нет вовсе (даже при других ингредиентах на пицце) ->
+    # равномерное покрытие площади пиццы, а не «подальше от остальных»
+    dets = [det("Pepperoni", 80, 80), det("Pepperoni", 500, 500)]
+    points = place_missing(dets, "Cheese", 6, (320, 320, 300), (640, 640))
+    assert len(points) == 6
+    radii = [math.hypot(x - 320, y - 320) for x, y in points]
+    assert max(radii) <= 0.7 * 300 + 1e-6, "точки не должны липнуть к краю"
+    assert max(radii) >= 0.3 * 300, "точки должны покрывать площадь до краёв"
+    pairwise = [math.dist(a, b) for a, b in combinations(points, 2)]
+    assert min(pairwise) >= 0.25 * 300, "точки не должны кучковаться"
+    # Одна точка -> центр пиццы
+    assert place_missing(dets, "Cheese", 1, (320, 320, 300), (640, 640)) == [(320, 320)]
+    print("ok: без своего класса — равномерно по всей пицце (спираль Вогеля)")
+
+
+def test_excess_report() -> None:
+    # Найдено больше нормы — класс в норме, но избыток отмечается
+    r = ClassReport("Pepperoni", 14, 18)
+    assert r.ok and r.excess == 4 and r.missing == 0
+    assert abs(r.completeness - 18 / 14) < 1e-9
+    print("ok: избыток считается и не заваливает вердикт")
+
+
+def test_extra_ingredient_in_reports() -> None:
+    # Лишний ингредиент — строка отчёта с надо=0, вердикт не валит, крестов нет
+    recipe = {"name": "Тест", "ingredients": {"Olives": 5}}
+    dets = [det("Olives", 100 + 30 * i, 100) for i in range(5)] + \
+           [det("Basil", 300, 300)] + [det(PIZZA_CLASS, 320, 320, 600)]
+    res = validate(dets, recipe, (640, 640))
+    assert res.passed, "лишний ингредиент не должен заваливать вердикт"
+    assert len(res.class_reports) == 2
+    extra = res.class_reports[-1]
+    assert extra.cls_name == "Basil" and extra.required == 0 and extra.found == 1
+    assert extra.is_extra and extra.ok
+    assert res.ok_count == 1 and len(res.recipe_reports) == 1
+    assert not res.removals and not res.suggestions
+    assert "Basil" in res.extras
+    print("ok: лишний ингредиент — строка с надо=0 и статусом «лишний»")
+
+
+def test_pick_removals_densest_first() -> None:
+    # 6 пеппероний: три кучкой слева, три далеко; избыток 2 — убрать 2 из кучки
+    cluster = [det("Pepperoni", 100, 100), det("Pepperoni", 118, 100),
+               det("Pepperoni", 136, 100)]
+    far = [det("Pepperoni", 400, 100), det("Pepperoni", 100, 400),
+           det("Pepperoni", 400, 400)]
+    dets = cluster + far
+    removals = pick_removals(dets, "Pepperoni", 2)
+    assert len(removals) == 2
+    centers = [((r.x1 + r.x2) / 2, (r.y1 + r.y2) / 2) for r in removals]
+    assert all(x < 200 for x, _ in centers), "должны выбрать из плотной кучки"
+    # end-to-end: рецепт требует 4, найдено 6 -> PASS, но 2 рамки «убрать»
+    recipe = {"name": "Тест", "ingredients": {"Pepperoni": 4}}
+    res = validate(dets, recipe, (640, 640))
+    assert res.passed and len(res.removals) == 2 and not res.suggestions
+    print("ok: при избытке отмечаются к удалению самые сгущённые")
 
 
 def test_class_report_suggestion_type() -> None:
@@ -110,6 +162,9 @@ if __name__ == "__main__":
     test_validate_verdict()
     test_place_missing_far_from_same_class()
     test_place_missing_spread()
-    test_place_missing_no_same_class_uses_all()
+    test_place_missing_no_same_class_spreads_evenly()
+    test_excess_report()
+    test_extra_ingredient_in_reports()
+    test_pick_removals_densest_first()
     test_class_report_suggestion_type()
     print("\nВсе тесты пройдены.")
