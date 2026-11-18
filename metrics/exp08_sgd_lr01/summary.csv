@@ -1,0 +1,5 @@
+metric,value
+metrics/precision(B),0.221395
+metrics/recall(B),0.204048
+metrics/mAP50(B),0.181561
+metrics/mAP50-95(B),0.106605
