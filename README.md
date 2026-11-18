@@ -62,9 +62,15 @@ python download_dataset.py
 ```
 
 Скачивает [Pizza-Toppings-Object-Detection](https://huggingface.co/datasets/mbar0075/Pizza-Toppings-Object-Detection)
-(~90 МБ, 3111 изображение) в `dataset/` и создаёт корректный `dataset/data.yaml`.
-Датасет основан на [Pizza Object Detector (Roboflow Universe)](https://universe.roboflow.com/advanced-computer-vision-assignment/pizza-object-detector/dataset/7),
-лицензия CC BY 4.0.
+(~90 МБ) в `dataset/` и создаёт корректный `dataset/data.yaml`.
+Реальное содержимое репозитория: **300 уникальных изображений** (по 100
+train/valid/test, 5680 размеченных экземпляров ингредиентов) — это подмножество
+исходного [Pizza Object Detector (Roboflow Universe)](https://universe.roboflow.com/advanced-computer-vision-assignment/pizza-object-detector/dataset/7)
+(3111 изображений), лицензия CC BY 4.0.
+
+Особенность данных: класс **Onion отсутствует в train** (0 экземпляров при 73 в test),
+Bacon и Broccoli почти исчезающе редки — это стоит учитывать при анализе метрик
+по классам (см. `dataset/class_distribution.csv`).
 
 ### 2. Обучение
 
