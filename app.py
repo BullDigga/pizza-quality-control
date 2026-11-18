@@ -15,19 +15,20 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from recipes import INGREDIENT_CLASSES, RecipeStore, ru_name
+from recipes import CLASS_NAMES, INGREDIENT_CLASSES, PIZZA_CLASS, RecipeStore, ru_name
 from validator import validate
 
 WEIGHTS = Path("weights") / "best.pt"
+NO_RECIPE = "— без рецепта —"  # пункт выбора пиццы: просто показать найденное
 
 # Палитра классов (индекс = id класса в data.yaml)
 PALETTE = [
@@ -36,6 +37,7 @@ PALETTE = [
     "#9a6324", "#fffac8", "#800000", "#aaffc3",
 ]
 MARKER_COLOR = QColor("#ff00ff")  # мишень «куда докинуть»
+REMOVE_COLOR = QColor("#e53935")  # рамка «эту убрать» при избытке
 
 
 def class_color(cls_name: str) -> QColor:
@@ -179,6 +181,10 @@ class MainWindow(QWidget):
         self.original: QPixmap | None = None
         self.detections: list = []
         self.suggestions: list = []
+        self.removals: list = []
+        # Отображение классов на картинке (чекбоксы в таблице результатов);
+        # влияет только на отрисовку рамок, не на подсчёт и валидацию
+        self.visible: dict[str, bool] = {cls: True for cls in CLASS_NAMES}
 
         self._build_ui()
 
@@ -213,21 +219,40 @@ class MainWindow(QWidget):
 
         conf_row = QHBoxLayout()
         conf_row.addWidget(QLabel("Порог уверенности:"))
-        self.conf_label = QLabel("25%")
+        self.conf_label = QLabel()
         conf_row.addWidget(self.conf_label)
+        conf_row.addStretch(1)
         actions.addLayout(conf_row)
+
+        # Живое обновление: детекция перезапускается не на каждый тик слайдера,
+        # а по дебаунс-таймеру — когда значение перестало меняться
+        self._conf_timer = QTimer(self)
+        self._conf_timer.setSingleShot(True)
+        self._conf_timer.setInterval(350)
+        self._conf_timer.timeout.connect(self.rerun_on_conf_change)
+
+        slider_row = QHBoxLayout()
+        btn_minus = QPushButton("−")
+        btn_plus = QPushButton("+")
+        for b in (btn_minus, btn_plus):
+            b.setFixedWidth(34)
+        btn_minus.clicked.connect(lambda: self._step_conf(-1))
+        btn_plus.clicked.connect(lambda: self._step_conf(1))
         self.conf_slider = QSlider(Qt.Orientation.Horizontal)
         self.conf_slider.setRange(5, 95)
-        self.conf_slider.setValue(25)
-        self.conf_slider.valueChanged.connect(
-            lambda v: self.conf_label.setText(f"{v}%"))
-        self.conf_slider.sliderReleased.connect(self.rerun_on_conf_change)
-        actions.addWidget(self.conf_slider)
+        self.conf_slider.setValue(15)  # под обученную модель: выше — теряем слабые классы
+        self.conf_slider.valueChanged.connect(self._on_conf_changed)
+        slider_row.addWidget(btn_minus)
+        slider_row.addWidget(self.conf_slider)
+        slider_row.addWidget(btn_plus)
+        actions.addLayout(slider_row)
+        self.conf_label.setText(f"{self.conf_slider.value()}%")
         panel.addWidget(box_actions)
 
         box_recipe = QGroupBox("Рецепт")
         recipe = QVBoxLayout(box_recipe)
         self.pizza_combo = QComboBox()
+        self.pizza_combo.addItem(NO_RECIPE)
         self.pizza_combo.addItems(self.store.names())
         recipe.addWidget(self.pizza_combo)
         row = QHBoxLayout()
@@ -247,20 +272,41 @@ class MainWindow(QWidget):
         self.verdict_label.setFont(font)
         self.verdict_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         result.addWidget(self.verdict_label)
-        self.table = QTableWidget(0, 5)
+        # Название проверяемой пиццы — появляется над таблицей после проверки
+        self.pizza_title_label = QLabel("")
+        self.pizza_title_label.setStyleSheet("font-weight: bold; color: #444;")
+        result.addWidget(self.pizza_title_label)
+
+        # Отображение отклонений от рецепта на картинке
+        deviations_row = QHBoxLayout()
+        self.show_add = QCheckBox("надо добавить")
+        self.show_add.setToolTip("Маджентовые мишени — куда докинуть недостающее")
+        self.show_add.setChecked(True)
+        self.show_add.stateChanged.connect(lambda _: self.render_image())
+        self.show_remove = QCheckBox("надо убрать")
+        self.show_remove.setToolTip("Красные крестики — какие избыточные убрать")
+        self.show_remove.setChecked(True)
+        self.show_remove.stateChanged.connect(lambda _: self.render_image())
+        deviations_row.addWidget(self.show_add)
+        deviations_row.addWidget(self.show_remove)
+        result.addLayout(deviations_row)
+        # Первый столбец — чекбокс отображения класса на картинке
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["Ингредиент", "Надо", "Найдено", "Полнота", "Статус"])
+            ["", "Ингредиент", "Надо", "Найдено", "Полнота", "Статус"])
         self.table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch)
-        for col in range(1, 5):
+            1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(2, 6):
             self.table.horizontalHeader().setSectionResizeMode(
                 col, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self._updating_table = False
+        self._row_classes: list[str] = []
+        self.table.itemChanged.connect(self._on_table_item_changed)
         result.addWidget(self.table)
-        self.extras_label = QLabel("")
-        self.extras_label.setWordWrap(True)
-        result.addWidget(self.extras_label)
         self.btn_save = QPushButton("Сохранить результат…")
         self.btn_save.clicked.connect(self.save_result)
         self.btn_save.setEnabled(False)
@@ -289,6 +335,8 @@ class MainWindow(QWidget):
         self.original = QPixmap(str(path))
         self.detections = []
         self.suggestions = []
+        self.removals = []
+        self.visible = {cls: True for cls in CLASS_NAMES}  # новая картинка — показываем всё
         self.clear_results()
         self.render_image()
         self.btn_detect.setEnabled(True)
@@ -333,9 +381,32 @@ class MainWindow(QWidget):
         if self.image_path is not None:
             self.run_detection()
 
+    def _on_conf_changed(self, value: int) -> None:
+        """Слайдер или кнопки изменили порог: обновляем подпись и
+        перезапускаем детекцию с debounce, чтобы не спамить прогонами."""
+        self.conf_label.setText(f"{value}%")
+        self._conf_timer.start()
+
+    def _step_conf(self, delta: int) -> None:
+        """Кнопки −/+ у порога уверенности."""
+        self.conf_slider.setValue(self.conf_slider.value() + delta)
+
+    # ---------- фильтр отображения классов ----------
+
+    def _on_table_item_changed(self, item: QTableWidgetItem) -> None:
+        """Чекбокс в первом столбце таблицы — показать/скрыть класс на картинке."""
+        if self._updating_table or item.column() != 0:
+            return
+        row = item.row()
+        if 0 <= row < len(self._row_classes):
+            cls = self._row_classes[row]
+            self.visible[cls] = item.checkState() == Qt.CheckState.Checked
+            self.render_image()
+
     def on_detected(self, detections: list) -> None:
         self.detections = detections
         self.suggestions = []
+        self.removals = []
         counts: dict[str, int] = {}
         for d in detections:
             counts[d.cls_name] = counts.get(d.cls_name, 0) + 1
@@ -354,57 +425,119 @@ class MainWindow(QWidget):
             return
         pizza = self.store.get(self.pizza_combo.currentText())
         if pizza is None:
-            self.status("Выберите пиццу из базы")
+            # «— без рецепта —»: просто показать, что найдено, с прочерками в «Надо»
+            self.suggestions = []
+            self.removals = []
+            self._show_detection_only()
+            self.render_image()
             return
         result = validate(self.detections, pizza,
                           (self.original.width(), self.original.height()))
         self.suggestions = result.suggestions
+        self.removals = result.removals
         self.show_results(result, pizza)
         self.render_image()
 
+    def _show_detection_only(self) -> None:
+        """Таблица найденных ингредиентов без сверки с рецептом."""
+        counts: dict[str, int] = {}
+        for d in self.detections:
+            if d.cls_name != PIZZA_CLASS:
+                counts[d.cls_name] = counts.get(d.cls_name, 0) + 1
+        rows = sorted(counts.items(), key=lambda kv: -kv[1])
+
+        self._updating_table = True
+        self.table.setRowCount(len(rows))
+        self._row_classes = [cls for cls, _ in rows]
+        for i, (cls, n) in enumerate(rows):
+            values = ["", ru_name(cls), "—", str(n), "—", "—"]
+            for j, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                if j == 0:
+                    item.setFlags(Qt.ItemFlag.ItemIsUserCheckable
+                                  | Qt.ItemFlag.ItemIsEnabled)
+                    item.setCheckState(
+                        Qt.CheckState.Checked if self.visible.get(cls, True)
+                        else Qt.CheckState.Unchecked)
+                self.table.setItem(i, j, item)
+        self._updating_table = False
+
+        self.pizza_title_label.setText("Без рецепта — только детекция")
+        self.verdict_label.setText("—")
+        self.verdict_label.setStyleSheet("")
+        self.extras_label.setText("")
+        total = sum(counts.values())
+        self.status(f"Без рецепта: найдено {total} объектов "
+                    f"({len(rows)} классов ингредиентов)")
+        self.btn_save.setEnabled(True)
+
     def show_results(self, result, pizza: dict) -> None:
         # Вердикт
+        self.pizza_title_label.setText(f"Рецепт: {pizza['name']}")
         if result.passed:
             self.verdict_label.setText("✔ ПРИГОДНА")
             self.verdict_label.setStyleSheet("color: #2e7d32;")
         else:
             self.verdict_label.setText("✘ БРАК")
             self.verdict_label.setStyleSheet("color: #c62828;")
-        # Таблица по классам
+        # Таблица по классам (0-й столбец — чекбокс отображения)
+        self._updating_table = True
         self.table.setRowCount(len(result.class_reports))
+        self._row_classes = [r.cls_name for r in result.class_reports]
         for i, report in enumerate(result.class_reports):
-            values = [report.name_ru, str(report.required), str(report.found),
-                      f"{report.completeness:.0%}",
-                      "✔" if report.ok else f"✘ докинуть {report.missing}"]
+            # Статус: ✔ только при точном совпадении; избыток и недостача —
+            # крестики; 90–99% и лишние классы — предупреждения
+            if report.is_extra:
+                status = "⚠ лишний"
+                color = "#ef6c00"
+            elif not report.ok:
+                status = f"✘ докинуть {report.missing}"
+                color = "#c62828"
+            elif report.excess > 0:
+                status = f"✘ избыток +{report.excess}"
+                color = "#c62828"
+            elif report.missing > 0:  # 90–99%: допустимо, но не «тютелька в тютельку»
+                status = f"≈ {report.completeness:.0%} (−{report.missing})"
+                color = "#ef6c00"
+            else:
+                status = "✔"
+                color = "#2e7d32"
+            values = ["", report.name_ru, str(report.required), str(report.found),
+                      "—" if report.is_extra else f"{report.completeness:.0%}",
+                      status]
             for j, text in enumerate(values):
                 item = QTableWidgetItem(text)
-                item.setForeground(QColor("#2e7d32") if report.ok
-                                   else QColor("#c62828"))
+                if j == 0:
+                    item.setFlags(Qt.ItemFlag.ItemIsUserCheckable
+                                  | Qt.ItemFlag.ItemIsEnabled)
+                    item.setCheckState(
+                        Qt.CheckState.Checked if self.visible.get(report.cls_name, True)
+                        else Qt.CheckState.Unchecked)
+                else:
+                    item.setForeground(QColor(color))
                 self.table.setItem(i, j, item)
-        # Лишние ингредиенты
-        if result.extras:
-            extra_counts = {}
-            for d in self.detections:
-                if d.cls_name in result.extras:
-                    extra_counts[d.cls_name] = extra_counts.get(d.cls_name, 0) + 1
-            text = "⚠ Лишние ингредиенты (нет в рецепте): " + ", ".join(
-                f"{ru_name(c)}×{n}" for c, n in sorted(extra_counts.items()))
-            self.extras_label.setText(text)
-        else:
-            self.extras_label.setText("")
+        self._updating_table = False
+        # Лишние ингредиенты — отдельные строки таблицы с «надо = 0»
         n_suggestions = len(result.suggestions)
+        excess_parts = [f"{r.name_ru} (+{r.excess})"
+                        for r in result.class_reports if r.excess > 0]
+        excess_note = ("; слишком много: " + ", ".join(excess_parts)) if excess_parts else ""
+        n_removals = len(result.removals)
+        if n_removals:
+            excess_note += f" — на картинке отмечено {n_removals} шт. к удалению"
+        n_recipe = len(result.recipe_reports)
         if result.passed:
-            self.status(f"«{pizza['name']}»: все ингредиенты в норме")
+            self.status(f"«{pizza['name']}»: все ингредиенты в норме{excess_note}")
         else:
-            self.status(f"«{pizza['name']}»: {result.ok_count}/{len(result.class_reports)} "
-                        f"ингредиентов в норме; точек «докинуть»: {n_suggestions}")
+            self.status(f"«{pizza['name']}»: {result.ok_count}/{n_recipe} "
+                        f"ингредиентов в норме; точек «докинуть»: {n_suggestions}{excess_note}")
         self.btn_save.setEnabled(True)
 
     def clear_results(self) -> None:
         self.verdict_label.setText("—")
         self.verdict_label.setStyleSheet("")
+        self.pizza_title_label.setText("")
         self.table.setRowCount(0)
-        self.extras_label.setText("")
         self.btn_save.setEnabled(False)
 
     def open_recipe_book(self) -> None:
@@ -412,6 +545,7 @@ class MainWindow(QWidget):
         dialog.exec()
         current = self.pizza_combo.currentText()
         self.pizza_combo.clear()
+        self.pizza_combo.addItem(NO_RECIPE)
         self.pizza_combo.addItems(self.store.names())
         if current in self.store.names():
             self.pizza_combo.setCurrentText(current)
@@ -423,32 +557,12 @@ class MainWindow(QWidget):
         painter = QPainter(canvas)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        font = QFont("Segoe UI", 13, QFont.Weight.Bold)
-        painter.setFont(font)
-        metrics = painter.fontMetrics()
-
-        # Рамки детекций
-        for d in self.detections:
-            color = class_color(d.cls_name)
-            painter.setPen(QPen(color, 3))
-            painter.drawRect(int(d.x1), int(d.y1),
-                             int(d.x2 - d.x1), int(d.y2 - d.y1))
-            label = f"{d.name_ru} {d.conf:.2f}"
-            text_w = metrics.horizontalAdvance(label) + 8
-            text_h = metrics.height() + 4
-            ty = int(d.y1) - text_h if d.y1 - text_h >= 0 else int(d.y1)
-            tx = int(d.x1)
-            if tx + text_w > canvas.width():  # не даем уйти за правый край
-                tx = canvas.width() - text_w
-            painter.fillRect(tx, ty, text_w, text_h, color)
-            painter.setPen(QPen(QColor("white")))
-            painter.drawText(tx + 4, ty + metrics.ascent() + 2, label)
-
-        # Мишени «куда докинуть»
+        # Сначала мишени «куда докинуть» (если включены) — чтобы рамки и подписи
+        # детекций рисовались поверх и не перекрывались ими
         marker_font = QFont("Segoe UI", 14, QFont.Weight.Bold)
         painter.setFont(marker_font)
         marker_metrics = painter.fontMetrics()
-        for s in self.suggestions:
+        for s in self.suggestions if self.show_add.isChecked() else []:
             painter.setPen(QPen(MARKER_COLOR, 4))
             painter.drawEllipse(int(s.x) - 24, int(s.y) - 24, 48, 48)
             painter.drawLine(int(s.x) - 32, int(s.y), int(s.x) + 32, int(s.y))
@@ -464,6 +578,54 @@ class MainWindow(QWidget):
                 painter.fillRect(tx, int(s.y) - 14, text_w, 24, MARKER_COLOR)
                 painter.setPen(QPen(QColor("white")))
                 painter.drawText(tx + 4, int(s.y) + 5, label)
+
+        # Затем рамки детекций с подписями (с учётом фильтра отображения)
+        font = QFont("Segoe UI", 13, QFont.Weight.Bold)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        for d in self.detections:
+            if not self.visible.get(d.cls_name, True):
+                continue  # класс скрыт чекбоксом в таблице — рамку не рисуем
+            color = class_color(d.cls_name)
+            painter.setPen(QPen(color, 3))
+            painter.drawRect(int(d.x1), int(d.y1),
+                             int(d.x2 - d.x1), int(d.y2 - d.y1))
+            label = f"{d.name_ru} {d.conf:.2f}"
+            text_w = metrics.horizontalAdvance(label) + 8
+            text_h = metrics.height() + 4
+            ty = int(d.y1) - text_h if d.y1 - text_h >= 0 else int(d.y1)
+            tx = int(d.x1)
+            if tx + text_w > canvas.width():  # не даем уйти за правый край
+                tx = canvas.width() - text_w
+            painter.fillRect(tx, ty, text_w, text_h, color)
+            painter.setPen(QPen(QColor("white")))
+            painter.drawText(tx + 4, ty + metrics.ascent() + 2, label)
+
+        # Поверх всего — метки «эту убрать» (избыток ингредиента, если включены)
+        remove_font = QFont("Segoe UI", 13, QFont.Weight.Bold)
+        painter.setFont(remove_font)
+        remove_metrics = painter.fontMetrics()
+        for rem in self.removals if self.show_remove.isChecked() else []:
+            pen = QPen(REMOVE_COLOR, 4)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(int(rem.x1), int(rem.y1),
+                             int(rem.x2 - rem.x1), int(rem.y2 - rem.y1))
+            painter.drawLine(int(rem.x1), int(rem.y1), int(rem.x2), int(rem.y2))
+            painter.drawLine(int(rem.x1), int(rem.y2), int(rem.x2), int(rem.y1))
+            label = f"− {rem.name_ru} (убрать)"
+            text_w = remove_metrics.horizontalAdvance(label) + 8
+            text_h = remove_metrics.height() + 4
+            ty = int(rem.y2) if rem.y2 + text_h <= canvas.height() else \
+                int(rem.y1) - text_h
+            tx = int(rem.x1)
+            if tx + text_w > canvas.width():
+                tx = canvas.width() - text_w
+            if tx < 0:
+                tx = 0
+            painter.fillRect(tx, ty, text_w, text_h, REMOVE_COLOR)
+            painter.setPen(QPen(QColor("white")))
+            painter.drawText(tx + 4, ty + remove_metrics.ascent() + 2, label)
 
         painter.end()
         return canvas
