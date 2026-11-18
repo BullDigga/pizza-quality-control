@@ -1,0 +1,7 @@
+# torch/torchvision ставятся отдельно — см. README (CPU или CUDA-сборка под вашу машину)
+ultralytics>=8.3.0
+PyQt6>=6.7
+huggingface_hub[hf_xet]>=0.26
+pillow>=10.0
+matplotlib>=3.8
+pandas>=2.0
