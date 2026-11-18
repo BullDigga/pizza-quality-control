@@ -1,0 +1,42 @@
+[
+  {
+    "name": "Пепперони",
+    "ingredients": {
+      "Pepperoni": 14,
+      "Cheese": 6
+    }
+  },
+  {
+    "name": "Гавайская",
+    "ingredients": {
+      "Ham": 13,
+      "Pineapple": 12,
+      "Cheese": 6
+    }
+  },
+  {
+    "name": "Сырная",
+    "ingredients": {
+      "Cheese": 6
+    }
+  },
+  {
+    "name": "Овощная",
+    "ingredients": {
+      "Tomatoes": 7,
+      "Peppers": 18,
+      "Mushroom": 10,
+      "Olives": 13,
+      "Basil": 6
+    }
+  },
+  {
+    "name": "Мясная",
+    "ingredients": {
+      "Pepperoni": 14,
+      "Ham": 13,
+      "Chicken": 11,
+      "Cheese": 6
+    }
+  }
+]
